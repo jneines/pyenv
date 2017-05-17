@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# pyenv - A script to create new Python environments based on miniconda3
+#
+# This can be used to quickly create new Python environments on Linux and MacOS
+# based machines without having Python installed beforehand.
+#
+# (c) Jens Nie, 2017
+
+# make sure to have these necessary tools available: bash, mktemp, rm, wget
+
+# here are some default settings. You might want to overwrite these in your local.conf file
+MINICONDA_DIR=/tmp/$USER/miniconda3
+BASE_URL="https://repo.continuum.io/miniconda"
+CHANNELS=""   # use an empty channel definition for defaults
+STD_PS1='\u@\h:\w> '
+DEBUG=0
+
+# end of settings section
+
+run_cmd ()
+{
+    if [[ $DEBUG -ne 0 ]]
+    then
+        v=$(exec 2>&1 && set -x && set -- "$@")
+        echo "#${v#*--}"
+        "$@"
+    else
+        "$@" > /dev/null 2>&1
+    fi
+}
+
+log ()
+{
+    # poor mans logger
+    if [[ $DEBUG -ne 0 ]]
+    then
+        echo $1 >&2
+    fi
+}
+
+usage ()
+{
+    # show usage information
+    echo "$0 ENVIRONMENT_NAME APPLICATION [PACKAGE [PACKAGE ...]]"
+}
+
+include ()
+{
+    # source file if existing
+    [[ -f "$1" ]] && source "$1"
+}
+
+ensure_bash ()
+{
+    # ensure we are running bash
+    if [[ -z $BASH_VERSION ]]
+    then
+        log "E: Only bash is currently supported."
+        exit 1
+    fi
+}
+
+get_pyenv_location ()
+{
+    # get script location
+    local script_location=${BASH_SOURCE[0]}
+    PYENV_DIR=$(dirname "$script_location")
+}
+
+get_python_version ()
+{
+    # we extract the python version to use from the environment label.
+    # It's based on the digits in the -py?? part of the label.
+    local environment_name=$1
+    local pattern="(.*)-py([0-9]+)"
+    [[ $environment_name =~ $pattern ]]
+    local environment_label="${BASH_REMATCH[1]}"
+    local pyversion_label="${BASH_REMATCH[2]}"
+    declare -a temp=()
+    for i in $(seq ${#pyversion_label})
+    do
+        temp+=("${pyversion_label:$i-1:1}")
+    done
+    PYTHON_VERSION=$(IFS=. ; echo "${temp[*]}")
+    log "D: requested Python version is: $PYTHON_VERSION."
+}
+
+parse_command_line ()
+{
+    # we expect an environment label first followed by an app label
+    # and an optional list of additional packages
+    if [[ ${#} -lt 2 ]]
+    then
+        log "E: at least 2 arguments are required."
+        usage
+        exit 1
+    fi
+    ENVIRONMENT_NAME=$1
+    get_python_version $ENVIRONMENT_NAME
+    PACKAGES="python=$PYTHON_VERSION "
+    shift
+
+    # process next command line parameter, which is an identifier for the app
+    case $1 in
+        jnnb)
+            log "D: jupyter notebook without browser requested."
+            APP="jupyter notebook --ip=$(hostname) --no-browser"
+            PACKAGES+="jupyter "
+            ;;
+        jn)
+            log "D: jupyter notebook requested."
+            APP="jupyter notebook"
+            PACKAGES+="jupyter "
+            ;;
+        python)
+            log "D: a plain python interpreter was requested."
+            APP=python
+            ;;
+        ipython)
+            log "D: an IPython interpreter was requested."
+            APP=ipython
+            PACKAGES+="ipython "
+            ;;
+        update)
+            log "D: updating the environment."
+            APP="conda update --all -y"
+            ;;
+        remove)
+            log "D: removing the environment."
+            APP="conda env remove -y -n $ENVIRONMENT_NAME"
+            ;;
+        bash)
+            log "D: a bash was requested."
+            APP="bash --noprofile --norc -i"
+            ;;
+        *)
+            log "D: hit the default path. That's a noop."
+            ;;
+    esac
+    shift
+
+    # if there are more command line parameters left, its a list of additional packages
+    PACKAGES+=$@
+}
+
+download_and_install_miniconda ()
+{
+    log "I: Downloading Miniconda."
+    if [[ $(uname) == "Darwin" ]]
+    then
+        # MacOS
+        os="MacOSX"
+    else
+        # Linux
+        os="Linux"
+    fi
+    machine=$(uname -m)
+    INSTALLER=Miniconda3-latest-$os-$machine.sh
+
+    TMPDIR=$(mktemp -d)
+
+    # Download latest installer
+    run_cmd wget -P $TMPDIR $BASE_URL/$INSTALLER
+    if [[ $? -ne 0 ]] 
+    then
+        log "E: Downloading the installer failed."
+        exit 2
+    fi
+    # Execute installer
+    log "I: Installing Miniconda."
+    run_cmd bash $TMPDIR/$INSTALLER -b -f -p $MINICONDA_DIR
+    if [[ $? -ne 0 ]]
+    then
+        log "E: Running the installer failed."
+        exit 3
+    fi
+
+    rm -rf $TMPDIR
+    if [[ $? -ne 0 ]]
+    then
+        log "W: Removing the installer failed."
+    fi
+}
+
+ensure_miniconda ()
+{
+    log "I: Checking for Miniconda"
+    if [[ -d $MINICONDA_DIR ]]
+    then
+        log "D: Miniconda already existing. Using available installation."
+    else
+        log "D: Miniconda not found. Performing fresh install."
+        download_and_install_miniconda
+    fi
+    CONDA_DEFAULT_ENV="root"
+    MINICONDA_BIN=$MINICONDA_DIR/bin
+    PATH=$MINICONDA_BIN:/usr/bin:/bin
+    log "D: Path after miniconda installation: $PATH"
+}
+
+ensure_environment ()
+{
+    ENVIRONMENT_NAME=$1
+    log "I: Checking for environment $ENVIRONMENT_NAME"
+    if [[ $(conda env list) == *"$ENVIRONMENT_NAME"* ]]
+    then
+        log "D: conda environment $ENVIRONMENT_NAME already exists."
+    else
+        log "D: creating new conda environment $ENVIRONMENT_NAME."
+        log "D: Packages to be installed: $PACKAGES"
+        run_cmd conda create $CHANNELS -y -n $ENVIRONMENT_NAME $PACKAGES
+        if [[ $? -ne 0 ]]
+        then
+            log "E: Creating the requested environment failed."
+            exit 4
+        fi
+    fi
+    CONDA_PREFIX=$MINICONDA_DIR/envs/$ENVIRONMENT_NAME
+    PATH=$CONDA_PREFIX/bin:$PATH
+    # ensure possibly new packages are installed
+    log "D: adding additional packages if necessary"
+    run_cmd conda install $CHANNELS -y -n $ENVIRONMENT_NAME $PACKAGES
+    if [[ $? -ne 0 ]]
+    then
+        log "E: Refreshing the environment failed."
+        exit 5
+    fi
+    log "D: Path after environment creation: $PATH"
+}
+
+run_app ()
+{
+    log "D: Environment name: $ENVIRONMENT_NAME"
+    log "D: App to start: \"$1\""
+    log "D: Packages: $PACKAGES"
+
+    log "I: Runnig requested application"
+    ENV_PS1="($ENVIRONMENT_NAME) $STD_PS1"
+    log "D: Entering subshell"
+    (
+        log "D: within subshell"
+        env \
+            PATH="$PATH" \
+            CONDA_PREFIX="$CONDA_PREFIX" \
+            CONDA_DEFAULT_ENV="$CONDA_DEFAULT_ENV" \
+            PS1="$ENV_PS1" \
+            $1
+    )
+    if [[ $? -ne 0 ]]
+    then
+        log "E: Running the requested application failed."
+        exit 6
+    fi
+    log "D: Exited subshell"
+}
+
+### main block
+
+# ensure we have a bash running
+ensure_bash
+
+# retrieve pyenv installation location and include local.conf if it exists
+get_pyenv_location
+
+include "$PYENV_DIR/local.conf"
+
+# parse the command line
+parse_command_line $@
+
+# we need to have a python version at this point
+ensure_miniconda
+
+# at this point we need a python version and an environment name with optional packages
+ensure_environment $ENVIRONMENT_NAME
+
+# here we need the environment and a commandline to launch
+run_app "$APP"
